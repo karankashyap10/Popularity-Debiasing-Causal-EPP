@@ -520,15 +520,37 @@ def train(config):
             user_groups["thresholds"],
             device,
             matching_scores_by_user=llm_score_cache,
+            group_assignments=user_groups["user_groups"],
         )
-        (output_dir / "calibration_lambdas.json").write_text(
-            json.dumps(user_groups, indent=2)
+        recommendation_comparison = calibrated_metrics.pop(
+            "recommendation_comparison"
+        )
+        (output_dir / "calibration_lambdas.json").write_text(json.dumps({
+            "lambdas": user_groups["lambdas"],
+            "thresholds": user_groups["thresholds"],
+            "user_groups": user_groups["user_groups"],
+        }, indent=2))
+        (output_dir / "calibration_lambda_diagnostics.json").write_text(
+            json.dumps(user_groups["diagnostics"], indent=2)
         )
         (output_dir / "popularity_calibrated_test_metrics.json").write_text(
             json.dumps(calibrated_metrics, indent=2)
         )
+        comparison_path = output_dir / "calibration_recommendation_comparison.json"
+        comparison_path.write_text(json.dumps(recommendation_comparison, indent=2))
         print("\nPopularity-calibrated test metrics:", calibrated_metrics)
         print("Calibration lambdas:", user_groups["lambdas"])
+        print("\nRecommendation-list comparison:")
+        print("CP_H vs Original:", recommendation_comparison[
+            "comparison_to_original_CausalEPP"]["CP_H"])
+        print("CP_Im vs Original:", recommendation_comparison[
+            "comparison_to_original_CausalEPP"]["CP_Im"])
+        print("CP_H vs CP_Im:", recommendation_comparison["CP_H_vs_CP_Im"])
+        print(
+            "CP_H and CP_Im identical lists:",
+            recommendation_comparison["CP_H_and_CP_Im_identical"],
+        )
+        print("Recommendation lists saved at:", comparison_path)
 
     metrics_path = output_dir / "test_metrics.json"
 

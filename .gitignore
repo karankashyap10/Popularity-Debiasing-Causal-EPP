@@ -1,2 +1,29 @@
 .DS_Store
 outputs
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment variables and secrets
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+!.env.template
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx

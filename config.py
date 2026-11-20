@@ -33,6 +33,7 @@ class Config:
     use_llm_matching: bool = False
     llm_model_id: str = "Qwen/Qwen3-0.6B"
     llm_device: str = "auto"
+    llm_batch_size: int = 4
     llm_candidate_pool: int = 50
     llm_history_length: int = 20
     device: str = "auto"
