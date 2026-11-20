@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from data.dataset import PairwiseTrainDataset
 from models import CausalEPP, LightGCN, total_loss
-from evaluate import ranking_metrics
+from evaluate import ranking_metrics, recommendation_examples
 from forecasting.moving_average import forecast_all
 from data.popularity import(
 compute_global_popularity,
@@ -195,6 +195,27 @@ def train(config):
         device=device,
     )
 
+    llm_score_cache = None
+    negative_candidates = None
+    item_names = {}
+    if config.use_llm_matching:
+        from llm_baseline import build_llm_matching_scores
+
+        (
+            llm_score_cache,
+            _llm_candidate_cache,
+            negative_candidates,
+            item_names,
+        ) = build_llm_matching_scores(
+            config,
+            train_df,
+            val_df,
+            test_df,
+            num_items,
+        )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     # Build LightGCN graph from training interactions only.
     norm_adj = LightGCN.normalized_adjacency(
         train_df,
@@ -223,6 +244,7 @@ def train(config):
         train_df,
         num_items,
         seed=config.seed,
+        negative_candidates=negative_candidates,
     )
 
     train_loader = DataLoader(
@@ -239,6 +261,9 @@ def train(config):
         window=config.moving_average_window,
         item_horizon=config.item_forecast_horizon,
         user_horizon=config.user_forecast_horizon,
+        method=config.forecast_method,
+        level_alpha=config.forecast_level_alpha,
+        trend_beta=config.forecast_trend_beta,
     )
 
     p_star = torch.tensor(
@@ -279,12 +304,31 @@ def train(config):
             # User EPP at the interaction time.
             user_epp = epp_tensor[bins, users]
 
+            if llm_score_cache is not None:
+                batch_users = users.cpu().tolist()
+                positive_ids = positive_items.cpu().tolist()
+                negative_ids = negative_items.cpu().tolist()
+                positive_matching = torch.tensor(
+                    [llm_score_cache[int(u)][int(i)] for u, i in zip(batch_users, positive_ids)],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                negative_matching = torch.tensor(
+                    [llm_score_cache[int(u)][int(i)] for u, i in zip(batch_users, negative_ids)],
+                    dtype=torch.float32,
+                    device=device,
+                )
+            else:
+                positive_matching = None
+                negative_matching = None
+
             positive_scores = model(
                 users,
                 positive_items,
                 norm_adj,
                 user_epp,
                 mean_popularity[positive_items],
+                matching_scores=positive_matching,
             )
 
             negative_scores = model(
@@ -293,6 +337,7 @@ def train(config):
                 norm_adj,
                 user_epp,
                 mean_popularity[negative_items],
+                matching_scores=negative_matching,
             )
 
             # Equation (10): quality supervision.
@@ -336,6 +381,7 @@ def train(config):
                     s_star,
                     config.eval_k,
                     device,
+                    matching_scores_by_user=llm_score_cache,
                 )
 
             validation_score = val_metrics["NDCG@K"]
@@ -375,15 +421,11 @@ def train(config):
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
     if not test_df.empty:
         with torch.no_grad():
             # Include both training and validation interactions
             # when excluding previously seen items during test evaluation.
-            test_history = pd.concat(
-                [train_df, val_df],
-                ignore_index=True
-            )
-
             test_metrics = ranking_metrics(
                 model,
                 norm_adj,
@@ -395,9 +437,98 @@ def train(config):
                 s_star,
                 config.eval_k,
                 device,
+                matching_scores_by_user=llm_score_cache,
             )
     else:
         test_metrics = {}
+
+    if not test_df.empty:
+        if not item_names:
+            item_mapping_path = data_dir / "item_mapping.csv"
+            if item_mapping_path.exists():
+                item_mapping = pd.read_csv(item_mapping_path)
+                if {"item", "raw_item"}.issubset(item_mapping.columns):
+                    item_names = dict(zip(
+                        item_mapping["item"].astype(int),
+                        item_mapping["raw_item"].astype(str),
+                    ))
+        examples = recommendation_examples(
+            model,
+            norm_adj,
+            test_history,
+            test_df,
+            num_users,
+            num_items,
+            p_star,
+            s_star,
+            config.eval_k,
+            device,
+            item_names=item_names,
+            max_users=5,
+            matching_scores_by_user=llm_score_cache,
+        )
+        examples["run_settings"] = {
+            "forecast_method": config.forecast_method,
+            "popularity_calibration_enabled": config.enable_popularity_calibration,
+            "checkpoint": "best validation NDCG",
+            "recommendation_list": "base CausalEPP ranking before optional calibration",
+        }
+        if config.use_llm_matching:
+            examples["run_settings"].update({
+                "matching_score_source": "local Hugging Face model in CausalEPP m_ui term",
+                "llm_model_id": config.llm_model_id,
+                "llm_candidate_pool": config.llm_candidate_pool,
+            })
+        examples_path = output_dir / "recommendation_examples.json"
+        examples_path.write_text(json.dumps(examples, indent=2))
+        print("Example recommendations saved at:", examples_path)
+
+    if config.enable_popularity_calibration and not val_df.empty and not test_df.empty:
+        from calibration import fit_group_lambdas, calibrated_ranking_metrics
+
+        global_counts_array = global_counts.detach().cpu().numpy()
+        user_groups = fit_group_lambdas(
+            model,
+            norm_adj,
+            train_df,
+            val_df,
+            num_users,
+            num_items,
+            p_star,
+            s_star,
+            global_counts_array,
+            config.eval_k,
+            config.calibration_candidate_pool,
+            config.calibration_lambda_grid,
+            device,
+            matching_scores_by_user=llm_score_cache,
+        )
+        test_history = pd.concat([train_df, val_df], ignore_index=True)
+        calibrated_metrics = calibrated_ranking_metrics(
+            model,
+            norm_adj,
+            test_history,
+            test_df,
+            num_users,
+            num_items,
+            p_star,
+            s_star,
+            global_counts_array,
+            config.eval_k,
+            config.calibration_candidate_pool,
+            user_groups["lambdas"],
+            user_groups["thresholds"],
+            device,
+            matching_scores_by_user=llm_score_cache,
+        )
+        (output_dir / "calibration_lambdas.json").write_text(
+            json.dumps(user_groups, indent=2)
+        )
+        (output_dir / "popularity_calibrated_test_metrics.json").write_text(
+            json.dumps(calibrated_metrics, indent=2)
+        )
+        print("\nPopularity-calibrated test metrics:", calibrated_metrics)
+        print("Calibration lambdas:", user_groups["lambdas"])
 
     metrics_path = output_dir / "test_metrics.json"
 

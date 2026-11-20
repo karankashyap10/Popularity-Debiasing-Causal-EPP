@@ -121,6 +121,7 @@ class CausalEPP(nn.Module):
         norm_adj,
         user_epp_values,
         item_pop_values,
+        matching_scores=None,
     ):
         """Compute recommendation scores using Equations (6)-(9)."""
         user_embeddings, item_embeddings = self.lightgcn.propagate(norm_adj)
@@ -129,7 +130,12 @@ class CausalEPP(nn.Module):
         item_vectors = item_embeddings[items]
 
         # Matching score m_ui.
-        matching = (user_vectors * item_vectors).sum(dim=-1)
+        if matching_scores is None:
+            matching = (user_vectors * item_vectors).sum(dim=-1)
+        else:
+            matching = matching_scores.to(
+                device=item_vectors.device, dtype=item_vectors.dtype
+            ).reshape(-1)
 
         s = user_epp_values.to(
             device=matching.device, dtype=matching.dtype

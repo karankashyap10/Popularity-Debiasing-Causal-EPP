@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 class PairwiseTrainDataset(Dataset):
     """Generate positive-negative interaction pairs for BPR training."""
 
-    def __init__(self, interactions, num_items, seed=42):
+    def __init__(self, interactions, num_items, seed=42, negative_candidates=None):
         self.df = interactions.reset_index(drop=True).copy()
         self.num_items = int(num_items)
 
@@ -47,6 +47,18 @@ class PairwiseTrainDataset(Dataset):
             )
             for user, positives in self.user_pos.items()
         }
+
+        if negative_candidates is not None:
+            for user, candidates in negative_candidates.items():
+                user = int(user)
+                positives = self.user_pos.get(user, set())
+                valid_candidates = np.setdiff1d(
+                    np.asarray(list(candidates), dtype=np.int64),
+                    np.fromiter(positives, dtype=np.int64),
+                    assume_unique=False,
+                )
+                if valid_candidates.size:
+                    self.user_neg_candidates[user] = valid_candidates
 
     def __len__(self):
         return len(self.df)
