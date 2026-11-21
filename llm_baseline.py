@@ -1,6 +1,7 @@
 """Local Hugging Face matching scores used as CausalEPP's m_ui term."""
 
 import json
+import hashlib
 from pathlib import Path
 import re
 
@@ -31,8 +32,12 @@ class LocalHuggingFaceScorer:
         else:
             raise ValueError("llm_device must be 'auto', 'cpu', or 'cuda'.")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, token=False)
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         load_options = {"torch_dtype": "auto" if use_cuda else torch.float32}
+        load_options["token"] = False
         if use_cuda:
             load_options["device_map"] = "auto"
         self.model = AutoModelForCausalLM.from_pretrained(model_id, **load_options)
@@ -74,58 +79,96 @@ class LocalHuggingFaceScorer:
 
     def score(self, profile, candidates):
         """Return one 0-1 relevance score for every (item_id, item_name)."""
-        pending = list(candidates)
-        scores = {}
+        return self.score_batch([(profile, candidates)])[0]
+
+    def score_batch(self, requests):
+        """Score multiple users together while preserving per-user retries."""
+        pending_requests = [
+            {"profile": profile, "pending": list(candidates), "scores": {}}
+            for profile, candidates in requests
+        ]
         for attempt in range(3):
-            candidate_text = "\n".join(
-                f"{item_id}\t{name.replace(chr(9), ' ').replace(chr(10), ' ')}"
-                for item_id, name in pending
-            )
-            prompt = (
-                "Score how relevant each candidate item is for the user, using only "
-                "the user's previous item titles. Return exactly one score from 0.0 "
-                "to 1.0 for every candidate ID. Return only a JSON object with item "
-                "IDs as keys and numeric scores as values. Do not explain. /no_think\n\n"
-                f"User's past item titles, oldest first:\n{profile}\n\n"
+            active_requests = [
+                request for request in pending_requests if request["pending"]
+            ]
+            if not active_requests:
+                break
+
+            formatted_prompts = []
+            for request in active_requests:
+                candidate_text = "\n".join(
+                    f"{item_id}\t{name.replace(chr(9), ' ').replace(chr(10), ' ')}"
+                    for item_id, name in request["pending"]
+                )
+                prompt=(
+                "Estimate a continuous relevance score for every candidate item based only on "
+                "the user's previously interacted item titles. Each score must be a JSON number "
+                "between 0.0 and 1.0 inclusive. Use the entire continuous range, including decimal "
+                "values between the endpoints (e.g., 0.13, 0.47, 0.86) whenever appropriate; "
+                "do not restrict scores to 0, 0.5, or 1. A higher score means greater relevance. "
+                "Return exactly one score for EVERY candidate ID. Output only a JSON object "
+                "with item IDs as keys and numeric scores as values, without explanation. /no_think\n\n"
+                f"User's past item titles, oldest first:\n{request['profile']}\n\n"
                 f"Candidates, ID then title:\n{candidate_text}"
+                )
+                formatted_prompts.append(self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                ))
+
+            inputs = self.tokenizer(
+                formatted_prompts,
+                return_tensors="pt",
+                padding=True,
             )
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            inputs = self.tokenizer(formatted_prompt, return_tensors="pt")
             inputs = {name: tensor.to(self.device) for name, tensor in inputs.items()}
+            max_new_tokens = max(
+                max(512, len(request["pending"]) * 12)
+                for request in active_requests
+            )
             with torch.inference_mode():
                 generated = self.model.generate(
                     **inputs,
-                    max_new_tokens=max(512, len(pending) * 12),
+                    max_new_tokens=max_new_tokens,
                     do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
-            response = self.tokenizer.decode(
-                generated[0, inputs["input_ids"].shape[-1]:],
+            responses = self.tokenizer.batch_decode(
+                generated[:, inputs["input_ids"].shape[-1]:],
                 skip_special_tokens=True,
             )
-            scores.update(self._parse_scores(
-                response, [item for item, _ in pending]
-            ))
-            pending = [row for row in pending if row[0] not in scores]
-            if not pending:
-                break
-            if attempt < 2:
+            for request, response in zip(active_requests, responses):
+                request["scores"].update(self._parse_scores(
+                    response,
+                    [item for item, _ in request["pending"]],
+                ))
+                request["pending"] = [
+                    row for row in request["pending"]
+                    if row[0] not in request["scores"]
+                ]
+
+            remaining = sum(
+                len(request["pending"]) for request in pending_requests
+            )
+            if remaining and attempt < 2:
                 print(
-                    f"LLM omitted {len(pending)} item score(s); "
+                    f"LLM omitted {remaining} item score(s); "
                     f"retrying them (attempt {attempt + 2}/3)."
                 )
 
-        if pending:
-            print(
-                f"Warning: LLM still omitted {len(pending)} item score(s) "
-                "after retries; assigning neutral score 0.5 to those items."
-            )
-            scores.update({item_id: 0.5 for item_id, _ in pending})
-        return scores
+        results = []
+        for request in pending_requests:
+            if request["pending"]:
+                print(
+                    f"Warning: LLM still omitted {len(request['pending'])} item score(s) "
+                    "after retries; assigning neutral score 0.5 to those items."
+                )
+                request["scores"].update({
+                    item_id: 0.5 for item_id, _ in request["pending"]
+                })
+            results.append(request["scores"])
+        return results
 
 
 def build_llm_matching_scores(config, train_df, val_df, test_df, num_items):
@@ -151,6 +194,50 @@ def build_llm_matching_scores(config, train_df, val_df, test_df, num_items):
         item_mapping["raw_item"].astype(str),
     ))
 
+    # Colab-generated ratings are user->item->score. Use them directly so the
+    # local Hugging Face model is never loaded when a combined cache is present.
+    combined_path = Path(config.llm_combined_path)
+    if not combined_path.exists():
+        fallback = Path(config.output_dir).parent / ".llm_cache" / "combined.json"
+        if fallback.exists():
+            combined_path = fallback
+    if combined_path.exists():
+        saved = json.loads(combined_path.read_text(encoding="utf-8"))
+        score_cache = {
+            int(user): {
+                int(item): float(score)
+                for item, score in scores.items()
+                if 0 <= int(item) < num_items and np.isfinite(float(score))
+            }
+            for user, scores in saved.items()
+        }
+        all_users = set(train_df.user.astype(int)) | set(val_df.user.astype(int)) | set(test_df.user.astype(int))
+        all_positives = {
+            int(user): set(group.item.astype(int))
+            for user, group in train_df.groupby("user")
+        }
+        missing_users = sorted(all_users - set(score_cache))
+        missing_positives = sorted(
+            (user, item) for user, positives in all_positives.items()
+            for item in positives if item not in score_cache.get(user, {})
+        )
+        if missing_users or missing_positives:
+            raise ValueError(
+                f"Combined LLM cache {combined_path} does not cover the processed data: "
+                f"{len(missing_users)} users and {len(missing_positives)} positive interactions missing. "
+            "Run data.filter_by_combined before preprocessing, then regenerate the data files."
+            )
+        score_cache = {user: score_cache[user] for user in sorted(all_users)}
+        candidate_cache = {user: sorted(score_cache[user]) for user in score_cache}
+        negative_candidates = {
+            user: [item for item in candidates if item not in all_positives.get(user, set())]
+            for user, candidates in candidate_cache.items()
+        }
+        if any(not values for values in negative_candidates.values()):
+            raise ValueError("Combined LLM cache has no negative candidates for at least one user")
+        print(f"Loaded Colab user-item ratings from {combined_path}")
+        return score_cache, candidate_cache, negative_candidates, item_names
+
     item_counts = train_df["item"].value_counts().reindex(
         range(num_items), fill_value=0
     )
@@ -163,8 +250,25 @@ def build_llm_matching_scores(config, train_df, val_df, test_df, num_items):
         for user, rows in train_df.groupby("user")
     }
 
-    cache_path = Path(config.output_dir) / "llm_matching_scores.json"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    pool_size = max(int(config.llm_candidate_pool), 1)
+    cache_settings = {
+        "model_id": config.llm_model_id,
+        "candidate_pool": pool_size,
+        "history_length": int(config.llm_history_length),
+        "num_items": int(num_items),
+        "prompt_version": 1,
+    }
+    cache_digest = hashlib.sha256(
+        json.dumps(cache_settings, sort_keys=True).encode("utf-8")
+    )
+    cache_digest.update(pd.util.hash_pandas_object(
+        train_df[["user", "item", "timestamp"]],
+        index=False,
+    ).to_numpy().tobytes())
+    cache_digest.update(mapping_path.read_bytes())
+    cache_dir = Path(config.output_dir).parent / ".llm_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"llm_matching_scores_{cache_digest.hexdigest()}.json"
     if cache_path.exists():
         saved = json.loads(cache_path.read_text())
         score_cache = {
@@ -174,37 +278,61 @@ def build_llm_matching_scores(config, train_df, val_df, test_df, num_items):
     else:
         score_cache = {}
 
-    scorer = LocalHuggingFaceScorer(config.llm_model_id, config.llm_device)
+    scorer = None
     candidate_cache = {}
-    pool_size = max(int(config.llm_candidate_pool), 1)
-    for index, user in enumerate(sorted(all_users), start=1):
-        positives = set(user_histories.get(user, []))
-        candidates = set(positives)
-        for item in popular_items:
-            candidates.add(int(item))
-            if len(candidates) >= pool_size:
-                break
-        candidate_ids = sorted(candidates)
-        candidate_cache[user] = candidate_ids
+    users = sorted(all_users)
+    can_batch = config.llm_device != "cpu" and torch.cuda.is_available()
+    batch_size = max(int(config.llm_batch_size), 1) if can_batch else 1
+    for batch_start in range(0, len(users), batch_size):
+        user_batch = users[batch_start:batch_start + batch_size]
+        score_requests = []
+        request_users = []
+        for offset, user in enumerate(user_batch):
+            index = batch_start + offset + 1
+            print(f"Processing user {user} ({index}/{len(users)})")
+            history = user_histories.get(user, [])
+            positives = set(history)
+            candidates = set(positives)
+            for item in popular_items:
+                candidates.add(int(item))
+                if len(candidates) >= pool_size:
+                    break
+            if positives and not any(item not in positives for item in candidates):
+                most_popular_negative = next(
+                    (int(item) for item in popular_items if int(item) not in positives),
+                    None,
+                )
+                if most_popular_negative is not None:
+                    candidates.add(most_popular_negative)
+            candidate_ids = sorted(candidates)
+            candidate_cache[user] = candidate_ids
 
-        cached_user_scores = score_cache.setdefault(user, {})
-        missing = [item for item in candidate_ids if item not in cached_user_scores]
-        if missing:
-            history = user_histories.get(user, [])[-config.llm_history_length:]
-            profile = "\n".join(
-                item_names.get(item, f"Item {item}") for item in history
-            ) or "No prior item history."
-            candidate_rows = [
-                (item, item_names.get(item, f"Item {item}")) for item in missing
-            ]
-            cached_user_scores.update(scorer.score(profile, candidate_rows))
+            cached_user_scores = score_cache.setdefault(user, {})
+            missing = [item for item in candidate_ids if item not in cached_user_scores]
+            if missing:
+                profile = "\n".join(
+                    item_names.get(item, f"Item {item}")
+                    for item in history[-config.llm_history_length:]
+                ) or "No prior item history."
+                score_requests.append((profile, [
+                    (item, item_names.get(item, f"Item {item}"))
+                    for item in missing
+                ]))
+                request_users.append(user)
+
+        if score_requests:
+            if scorer is None:
+                scorer = LocalHuggingFaceScorer(
+                    config.llm_model_id,
+                    config.llm_device,
+                )
+            batch_scores = scorer.score_batch(score_requests)
+            for user, scores in zip(request_users, batch_scores):
+                score_cache[user].update(scores)
             cache_path.write_text(json.dumps({
                 str(uid): {str(item): score for item, score in scores.items()}
                 for uid, scores in score_cache.items()
             }))
-        if index % 25 == 0 or index == len(all_users):
-            print(f"Prepared local LLM scores for {index}/{len(all_users)} users")
-
     score_cache = {
         user: {item: score_cache[user][item] for item in candidate_ids}
         for user, candidate_ids in candidate_cache.items()

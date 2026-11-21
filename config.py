@@ -31,8 +31,10 @@ class Config:
     calibration_candidate_pool: int = 150
     calibration_lambda_grid: tuple = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
     use_llm_matching: bool = False
+    llm_combined_path: str = "outputs/Ciao/.llm_cache/combined.filtered.json"
     llm_model_id: str = "Qwen/Qwen3-0.6B"
     llm_device: str = "auto"
+    llm_batch_size: int = 4
     llm_candidate_pool: int = 50
     llm_history_length: int = 20
     device: str = "auto"
