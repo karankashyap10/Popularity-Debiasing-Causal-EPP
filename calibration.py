@@ -1,6 +1,7 @@
 """Popularity-calibrated re-ranking inspired by calibrated popularity work."""
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -54,10 +55,10 @@ def _js_divergence(left, right):
 
     def kl(p, q):
         mask = p > 0
-        return float(np.sum(p[mask] * np.log2(p[mask] / q[mask])))
+        return float(np.sum(p[mask] * np.log(p[mask] / q[mask])))
 
     divergence = 0.5 * kl(left, middle) + 0.5 * kl(right, middle)
-    return float(np.clip(divergence, 0.0, 1.0))
+    return float(max(divergence, 0.0))
 
 
 def _js_divergence_rows(target, rows):
@@ -66,13 +67,13 @@ def _js_divergence_rows(target, rows):
     rows = np.asarray(rows, dtype=np.float64)
     rows = rows / np.maximum(rows.sum(axis=1, keepdims=True), 1e-12)
     middle = 0.5 * (rows + target[None, :])
-    left = np.where(target[None, :] > 0, target[None, :] * np.log2(
+    left = np.where(target[None, :] > 0, target[None, :] * np.log(
         np.maximum(target[None, :], 1e-300) / np.maximum(middle, 1e-300)
     ), 0.0).sum(axis=1)
-    right = np.where(rows > 0, rows * np.log2(
+    right = np.where(rows > 0, rows * np.log(
         np.maximum(rows, 1e-300) / np.maximum(middle, 1e-300)
     ), 0.0).sum(axis=1)
-    return np.clip(0.5 * (left + right), 0.0, 1.0)
+    return np.clip(0.5 * (left + right), 0.0, np.log(2.0))
 
 
 def _make_candidate_cache(
@@ -313,6 +314,87 @@ def _metrics_for(cache, users, k, weight, popularity):
     }
 
 
+def _lightgcn_candidate_cache(model, graph, train_df, seen_df, eval_df,
+                             num_users, num_items, global_counts,
+                             candidate_pool, device):
+    """Build calibration candidates from standalone LightGCN dot-product scores."""
+    counts = np.asarray(global_counts, dtype=np.float64)
+    tiers = _tiers(counts)
+    means, thresholds = _profile_groups(train_df, num_users, counts)
+    histories = {int(u): g.item.to_numpy(dtype=np.int64)
+                 for u, g in train_df.groupby("user")}
+    seen = seen_df.groupby("user").item.apply(set).to_dict()
+    truth = eval_df.groupby("user").item.apply(set).to_dict()
+    cache = {}
+    model.eval()
+    with torch.no_grad():
+        user_emb, item_emb = model.propagate(graph)
+        for user, targets in truth.items():
+            user = int(user)
+            if user >= num_users or not targets:
+                continue
+            scores = (user_emb[user].unsqueeze(0) * item_emb).sum(-1)
+            previous = seen.get(user, set())
+            if previous:
+                scores[list(previous)] = -torch.inf
+            valid_scores = scores.detach().cpu().numpy().astype(np.float64)
+            valid = np.flatnonzero(np.isfinite(valid_scores))
+            if not valid.size:
+                continue
+            order = valid[np.argsort(-valid_scores[valid], kind="stable")]
+            items = order[:max(int(candidate_pool), 1)]
+            rel = valid_scores[items]
+            span = float(rel.max() - rel.min()) if rel.size else 0.0
+            rel = (rel - rel.min()) / span if span > 1e-12 else np.ones_like(rel)
+            history = histories.get(user, np.empty(0, dtype=np.int64))
+            target = np.bincount(tiers[history], minlength=3).astype(np.float64)
+            if target.sum() == 0:
+                target = np.array([1.0, 0.0, 0.0])
+            cache[user] = {
+                "truth": set(map(int, targets)), "items": items,
+                "relevance": rel, "tier": tiers[items], "target": target,
+                "profile_items": history,
+                "group": _group_name(user, means, thresholds),
+            }
+    return cache, thresholds
+
+
+def calibrate_lightgcn(model, graph, train_df, val_df, test_df, num_users,
+                       num_items, global_counts, k=20, candidate_pool=150,
+                       lambda_grid=None, device="cpu"):
+    """Select CP_H weights on validation and evaluate CP_H/CP_JS on test."""
+    grid = np.linspace(0.0, 1.0, 11) if lambda_grid is None else np.asarray(lambda_grid, dtype=float)
+    val_cache, thresholds = _lightgcn_candidate_cache(
+        model, graph, train_df, train_df, val_df, num_users, num_items,
+        global_counts, max(candidate_pool, k), device)
+    lambdas, diagnostics = {}, {"lambda_grid": grid.tolist(), "groups": {}}
+    popularity = np.asarray(global_counts, dtype=np.float64)
+    for group in GROUPS:
+        users = [u for u, entry in val_cache.items() if entry["group"] == group]
+        scored = []
+        for weight in grid:
+            metrics = _metrics_for(val_cache, users, k, float(weight), popularity)
+            scored.append(( _harmonic_objective(metrics["NDCG@K"], metrics["CalibrationQuality"]), float(weight), metrics))
+        best = max(scored, key=lambda x: (x[0], -x[1])) if scored else (0.0, 0.0, {})
+        lambdas[group] = best[1]
+        diagnostics["groups"][group] = {"validation_users": len(users), "selected_lambda": best[1], "validation_metrics": best[2]}
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
+    test_cache, _ = _lightgcn_candidate_cache(
+        model, graph, train_df, test_history, test_df, num_users, num_items,
+        global_counts, max(candidate_pool, k), device)
+    outputs = {}
+    for name, weight in (("CP_H", lambdas), ("CP_JS", 1.0)):
+        grouped = {g: _metrics_for(test_cache, [u for u,e in test_cache.items() if e["group"] == g], k, weight, popularity) for g in GROUPS}
+        grouped["All"] = _metrics_for(test_cache, list(test_cache), k, weight, popularity)
+        outputs[name] = grouped
+    outputs["metadata"] = {"model": "LightGCN dot-product scores", "k": k,
+                           "candidate_pool": max(candidate_pool, k),
+                           "popularity_and_profiles_from": "training interactions only",
+                           "lambda_selected_on": "validation only", "lambda_values": lambdas,
+                           "profile_group_thresholds": thresholds}
+    return outputs, diagnostics
+
+
 def _harmonic_objective(accuracy, calibration_quality):
     denominator = accuracy + calibration_quality
     if denominator <= 0.0:
@@ -529,7 +611,7 @@ def calibrated_ranking_metrics(
     method_weights = (
         ("Original_CausalEPP", {group: 0.0 for group in GROUPS}),
         ("CP_H", lambdas),
-        ("CP_Im", {group: 1.0 for group in GROUPS}),
+        ("CP_JS", {group: 1.0 for group in GROUPS}),
     )
     recommendation_lists = {}
     for method, weights in method_weights:
@@ -557,7 +639,7 @@ def calibrated_ranking_metrics(
 
     original_lists = recommendation_lists["Original_CausalEPP"]
     cp_h_lists = recommendation_lists["CP_H"]
-    cp_im_lists = recommendation_lists["CP_Im"]
+    cp_js_lists = recommendation_lists["CP_JS"]
     comparison = {
         "evaluation_user_count": len(cache),
         "k": int(k),
@@ -566,11 +648,11 @@ def calibrated_ranking_metrics(
         - len(cache),
         "comparison_to_original_CausalEPP": {
             "CP_H": _compare_recommendation_lists(original_lists, cp_h_lists),
-            "CP_Im": _compare_recommendation_lists(original_lists, cp_im_lists),
+            "CP_JS": _compare_recommendation_lists(original_lists, cp_js_lists),
         },
-        "CP_H_vs_CP_Im": _compare_recommendation_lists(cp_h_lists, cp_im_lists),
-        "CP_H_and_CP_Im_identical": all(
-            cp_h_lists[user] == cp_im_lists[user] for user in cp_h_lists
+        "CP_H_vs_CP_JS": _compare_recommendation_lists(cp_h_lists, cp_js_lists),
+        "CP_H_and_CP_JS_identical": all(
+            cp_h_lists[user] == cp_js_lists[user] for user in cp_h_lists
         ),
         "recommendation_lists": {
             str(user): {

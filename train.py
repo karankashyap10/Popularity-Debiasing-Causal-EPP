@@ -145,7 +145,96 @@ def load_training_data(data_dir):
     )
 
 
-def train(config):
+def train_lightgcn(config):
+    """Train a standalone LightGCN BPR recommender and save its results."""
+    set_seed(config.seed)
+    device = get_device(config)
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (train_df, val_df, test_df, _edges, _pop, _epp, num_users, num_items) = load_training_data(config.data_dir)
+    graph = LightGCN.normalized_adjacency(train_df, num_users, num_items, device)
+    model = LightGCN(num_users, num_items, config.embedding_dim, config.lightgcn_layers).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    loader = DataLoader(PairwiseTrainDataset(train_df, num_items, seed=config.seed),
+                        batch_size=config.batch_size, shuffle=True, num_workers=0)
+    best_score = -float("inf")
+    checkpoint_path = output_dir / "lightgcn.pt"
+
+    def evaluate(history, truth):
+        model.eval()
+        seen = history.groupby("user").item.apply(set).to_dict()
+        relevant = truth.groupby("user").item.apply(set).to_dict()
+        recalls, precisions, ndcgs = [], [], []
+        recommended_items = set()
+        with torch.no_grad():
+            user_emb, item_emb = model.propagate(graph)
+            for user, target in relevant.items():
+                if not target:
+                    continue
+                scores = user_emb[int(user)] @ item_emb.T
+                previous = seen.get(user, set())
+                if previous:
+                    scores[list(previous)] = -torch.inf
+                k = min(config.eval_k, num_items - len(previous))
+                if k <= 0:
+                    continue
+                recs = torch.topk(scores, k).indices.cpu().tolist()
+                recommended_items.update(recs)
+                hits = [int(item in target) for item in recs]
+                recalls.append(sum(hits) / len(target))
+                precisions.append(sum(hits) / config.eval_k)
+                dcg = sum(hit / np.log2(rank + 2) for rank, hit in enumerate(hits))
+                idcg = sum(1 / np.log2(rank + 2) for rank in range(min(len(target), k)))
+                ndcgs.append(dcg / idcg if idcg else 0.0)
+        return {
+            "Recall@K": float(np.mean(recalls)) if recalls else 0.0,
+            "Precision@K": float(np.mean(precisions)) if precisions else 0.0,
+            "NDCG@K": float(np.mean(ndcgs)) if ndcgs else 0.0,
+            "CatalogCoverage@K": len(recommended_items) / num_items if num_items else 0.0,
+        }
+
+    for epoch in range(1, config.epochs + 1):
+        model.train()
+        for users, positives, negatives, _ in loader:
+            users, positives, negatives = users.to(device), positives.to(device), negatives.to(device)
+            user_emb, item_emb = model.propagate(graph)
+            pos_score = (user_emb[users] * item_emb[positives]).sum(-1)
+            neg_score = (user_emb[users] * item_emb[negatives]).sum(-1)
+            loss = torch.nn.functional.softplus(neg_score - pos_score).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        val_metrics = evaluate(train_df, val_df) if not val_df.empty else {"NDCG@K": 0.0}
+        score = val_metrics.get("NDCG@K", 0.0)
+        print(f"Epoch {epoch:03d} | Validation: {val_metrics}")
+        if score > best_score:
+            best_score = score
+            torch.save({"model": model.state_dict(), "num_users": num_users,
+                        "num_items": num_items, "config": config.__dict__}, checkpoint_path)
+    if checkpoint_path.exists():
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=False)["model"])
+    test_metrics = evaluate(pd.concat([train_df, val_df], ignore_index=True), test_df)
+    (output_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
+    print("LightGCN test metrics:", test_metrics)
+    if config.enable_popularity_calibration and not val_df.empty and not test_df.empty:
+        from calibration import calibrate_lightgcn
+        counts = compute_global_popularity(train_df, num_items=num_items)
+        calibrated, diagnostics = calibrate_lightgcn(
+            model, graph, train_df, val_df, test_df, num_users, num_items,
+            counts, k=config.eval_k,
+            candidate_pool=config.calibration_candidate_pool,
+            lambda_grid=config.calibration_lambda_grid, device=device,
+        )
+        (output_dir / "popularity_calibrated_test_metrics.json").write_text(
+            json.dumps(calibrated, indent=2))
+        (output_dir / "calibration_lambda_diagnostics.json").write_text(
+            json.dumps(diagnostics, indent=2))
+    return model, test_metrics, np.zeros(num_items), np.zeros(num_items)
+
+
+def train(config, lightgcn_only=False):
+    if lightgcn_only:
+        return train_lightgcn(config)
     set_seed(config.seed)
 
     device = get_device(config)
@@ -543,12 +632,12 @@ def train(config):
         print("\nRecommendation-list comparison:")
         print("CP_H vs Original:", recommendation_comparison[
             "comparison_to_original_CausalEPP"]["CP_H"])
-        print("CP_Im vs Original:", recommendation_comparison[
-            "comparison_to_original_CausalEPP"]["CP_Im"])
-        print("CP_H vs CP_Im:", recommendation_comparison["CP_H_vs_CP_Im"])
+        print("CP_JS vs Original:", recommendation_comparison[
+            "comparison_to_original_CausalEPP"]["CP_JS"])
+        print("CP_H vs CP_JS:", recommendation_comparison["CP_H_vs_CP_JS"])
         print(
-            "CP_H and CP_Im identical lists:",
-            recommendation_comparison["CP_H_and_CP_Im_identical"],
+            "CP_H and CP_JS identical lists:",
+            recommendation_comparison["CP_H_and_CP_JS_identical"],
         )
         print("Recommendation lists saved at:", comparison_path)
 

@@ -100,13 +100,16 @@ class LocalHuggingFaceScorer:
                     f"{item_id}\t{name.replace(chr(9), ' ').replace(chr(10), ' ')}"
                     for item_id, name in request["pending"]
                 )
-                prompt = (
-                    "Score how relevant each candidate item is for the user, using only "
-                    "the user's previous item titles. Return exactly one score from 0.0 "
-                    "to 1.0 for every candidate ID. Return only a JSON object with item "
-                    "IDs as keys and numeric scores as values. Do not explain. /no_think\n\n"
-                    f"User's past item titles, oldest first:\n{request['profile']}\n\n"
-                    f"Candidates, ID then title:\n{candidate_text}"
+                prompt=(
+                "Estimate a continuous relevance score for every candidate item based only on "
+                "the user's previously interacted item titles. Each score must be a JSON number "
+                "between 0.0 and 1.0 inclusive. Use the entire continuous range, including decimal "
+                "values between the endpoints (e.g., 0.13, 0.47, 0.86) whenever appropriate; "
+                "do not restrict scores to 0, 0.5, or 1. A higher score means greater relevance. "
+                "Return exactly one score for EVERY candidate ID. Output only a JSON object "
+                "with item IDs as keys and numeric scores as values, without explanation. /no_think\n\n"
+                f"User's past item titles, oldest first:\n{request['profile']}\n\n"
+                f"Candidates, ID then title:\n{candidate_text}"
                 )
                 formatted_prompts.append(self.tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}],
@@ -190,6 +193,50 @@ def build_llm_matching_scores(config, train_df, val_df, test_df, num_items):
         item_mapping["item"].astype(int),
         item_mapping["raw_item"].astype(str),
     ))
+
+    # Colab-generated ratings are user->item->score. Use them directly so the
+    # local Hugging Face model is never loaded when a combined cache is present.
+    combined_path = Path(config.llm_combined_path)
+    if not combined_path.exists():
+        fallback = Path(config.output_dir).parent / ".llm_cache" / "combined.json"
+        if fallback.exists():
+            combined_path = fallback
+    if combined_path.exists():
+        saved = json.loads(combined_path.read_text(encoding="utf-8"))
+        score_cache = {
+            int(user): {
+                int(item): float(score)
+                for item, score in scores.items()
+                if 0 <= int(item) < num_items and np.isfinite(float(score))
+            }
+            for user, scores in saved.items()
+        }
+        all_users = set(train_df.user.astype(int)) | set(val_df.user.astype(int)) | set(test_df.user.astype(int))
+        all_positives = {
+            int(user): set(group.item.astype(int))
+            for user, group in train_df.groupby("user")
+        }
+        missing_users = sorted(all_users - set(score_cache))
+        missing_positives = sorted(
+            (user, item) for user, positives in all_positives.items()
+            for item in positives if item not in score_cache.get(user, {})
+        )
+        if missing_users or missing_positives:
+            raise ValueError(
+                f"Combined LLM cache {combined_path} does not cover the processed data: "
+                f"{len(missing_users)} users and {len(missing_positives)} positive interactions missing. "
+            "Run data.filter_by_combined before preprocessing, then regenerate the data files."
+            )
+        score_cache = {user: score_cache[user] for user in sorted(all_users)}
+        candidate_cache = {user: sorted(score_cache[user]) for user in score_cache}
+        negative_candidates = {
+            user: [item for item in candidates if item not in all_positives.get(user, set())]
+            for user, candidates in candidate_cache.items()
+        }
+        if any(not values for values in negative_candidates.values()):
+            raise ValueError("Combined LLM cache has no negative candidates for at least one user")
+        print(f"Loaded Colab user-item ratings from {combined_path}")
+        return score_cache, candidate_cache, negative_candidates, item_names
 
     item_counts = train_df["item"].value_counts().reindex(
         range(num_items), fill_value=0

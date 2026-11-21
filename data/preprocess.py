@@ -37,8 +37,7 @@ def _chronological_split(df):
     """
     Chronologically split interactions.
 
-    First 90% of the timeline: training.
-    Remaining 10%: validation and test, split chronologically.
+    Chronological 80/10/10 train, validation, and test periods.
     """
     df = df.sort_values(
         ["timestamp", "user", "item"]
@@ -46,7 +45,7 @@ def _chronological_split(df):
 
     timestamps = df["timestamp"].to_numpy(dtype=np.float64)
 
-    train_cutoff = np.quantile(timestamps, 0.90)
+    train_cutoff = np.quantile(timestamps, 0.80)
 
     train = df[df["timestamp"] < train_cutoff].copy()
     holdout = df[df["timestamp"] >= train_cutoff].copy()
@@ -54,18 +53,10 @@ def _chronological_split(df):
     if train.empty or holdout.empty:
         raise ValueError("Unable to create chronological split.")
 
-    validation_cutoff = np.quantile(
-        holdout["timestamp"].to_numpy(dtype=np.float64),
-        0.50,
-    )
+    validation_cutoff = np.quantile(timestamps, 0.90)
 
-    val = holdout[
-        holdout["timestamp"] <= validation_cutoff
-    ].copy()
-
-    test = holdout[
-        holdout["timestamp"] > validation_cutoff
-    ].copy()
+    val = df[(df["timestamp"] >= train_cutoff) & (df["timestamp"] < validation_cutoff)].copy()
+    test = df[df["timestamp"] >= validation_cutoff].copy()
 
     # Handle tied timestamps at the split boundary.
     if val.empty or test.empty:

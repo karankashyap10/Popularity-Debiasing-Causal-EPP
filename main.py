@@ -1,8 +1,6 @@
 
 import argparse
-from datetime import datetime
 from pathlib import Path
-import re
 
 from config import Config
 from data.preprocess import prepare_ciao
@@ -42,6 +40,10 @@ def main():
         action="store_true",
         help="Train CausalEPP with a local Hugging Face LLM score as m_ui",
     )
+    parser.add_argument("--lightgcn-only", action="store_true",
+                        help="Train and evaluate a standalone LightGCN recommender")
+    parser.add_argument("--raw-file", default=None,
+                        help="Raw ratings path used when --preprocess is set")
 
     args = parser.parse_args()
     config = Config()
@@ -54,15 +56,19 @@ def main():
     config.enable_popularity_calibration = args.calibrate
     config.use_llm_matching = args.llm_baseline
 
-    run_time = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    if args.llm_baseline:
-        model_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", config.llm_model_id)
-        run_label = f"causalepp_llm_{model_label}"
-    else:
-        run_label = f"causalepp_{config.forecast_method}"
-        if config.enable_popularity_calibration:
-            run_label += "_calibrated"
-    config.output_dir = str(Path(config.output_dir) / f"{run_label}_{run_time}")
+    if args.lightgcn_only and args.llm_baseline:
+        parser.error("--lightgcn-only and --llm-baseline cannot be combined")
+    if args.raw_file is not None:
+        config.raw_file = args.raw_file
+    method = "lightgcn" if args.lightgcn_only else (
+        "causalepp_llm" if args.llm_baseline else "causalepp"
+    )
+    output_root = Path(config.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    run_number = 1
+    while (output_root / f"{method}_run-{run_number:03d}").exists():
+        run_number += 1
+    config.output_dir = str(output_root / f"{method}_run-{run_number:03d}")
 
     # Step 2: Preprocess data if requested
     if args.preprocess:
@@ -81,14 +87,14 @@ def main():
         print("Preprocessing completed.")
 
     # Step 3: Train the model
-    print("Starting CausalEPP training...")
+    print(f"Starting {method} training...")
 
     (
         model,
         test_metrics,
         global_popularity,
         expected_popularity
-    ) = train(config)
+    ) = train(config, lightgcn_only=args.lightgcn_only)
 
     # Step 4: Display returned results
     print("\nTraining completed successfully!")
