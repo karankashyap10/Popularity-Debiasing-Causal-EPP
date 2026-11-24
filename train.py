@@ -157,7 +157,7 @@ def train_lightgcn(config):
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     loader = DataLoader(PairwiseTrainDataset(train_df, num_items, seed=config.seed),
                         batch_size=config.batch_size, shuffle=True, num_workers=0)
-    best_score = -float("inf")
+    best_score = (-float("inf"), -float("inf"))
     checkpoint_path = output_dir / "lightgcn.pt"
 
     def evaluate(history, truth):
@@ -205,7 +205,9 @@ def train_lightgcn(config):
             loss.backward()
             optimizer.step()
         val_metrics = evaluate(train_df, val_df) if not val_df.empty else {"NDCG@K": 0.0}
-        score = val_metrics.get("NDCG@K", 0.0)
+        # Prefer relevance first; use catalog coverage to break NDCG ties.
+        score = (val_metrics.get("NDCG@K", 0.0),
+                 val_metrics.get("CatalogCoverage@K", 0.0))
         print(f"Epoch {epoch:03d} | Validation: {val_metrics}")
         if score > best_score:
             best_score = score
@@ -367,7 +369,7 @@ def train(config, lightgcn_only=False):
         device=device,
     )
 
-    best_score = -float("inf")
+    best_score = (-float("inf"), -float("inf"))
     best_path = output_dir / "causalepp_ciao.pt"
 
     # -------------------- Training --------------------
@@ -473,11 +475,12 @@ def train(config, lightgcn_only=False):
                     matching_scores_by_user=llm_score_cache,
                 )
 
-            validation_score = val_metrics["NDCG@K"]
+            validation_score = (val_metrics["NDCG@K"],
+                                val_metrics["CatalogCoverage@K"])
 
         else:
             val_metrics = {}
-            validation_score = -average_loss
+            validation_score = (-average_loss, 0.0)
 
         print(
             f"Epoch {epoch:03d} | "

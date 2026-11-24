@@ -1,5 +1,8 @@
 .DS_Store
-outputs
+outputs/*
+!outputs/Ciao/
+outputs/Ciao/*
+!outputs/Ciao/.llm_cache/
 
 # Local Python environments
 .venv/

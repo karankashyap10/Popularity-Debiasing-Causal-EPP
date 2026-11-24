@@ -66,8 +66,8 @@ def moving_average_forecast(series, window=10, horizon=1.0):
 def holt_forecast(series, horizon=1.0, level_alpha=0.3, trend_beta=0.1):
     """Forecast with Holt's double exponential smoothing.
 
-    The level and trend are updated with exponentially decaying weights, so
-    recent observations affect the forecast more than older observations.
+    Select level and trend smoothing parameters by one-step-ahead squared
+    error on this series, then retain that pair for the final forecast.
     """
     x = np.asarray(series, dtype=np.float64).reshape(-1)
 
@@ -81,6 +81,29 @@ def holt_forecast(series, horizon=1.0, level_alpha=0.3, trend_beta=0.1):
         raise ValueError("trend_beta must be in (0, 1].")
     if not np.all(np.isfinite(x)):
         raise ValueError("Series contains NaN or infinite values.")
+
+    if x.size >= 3:
+        # Search a compact grid and include the caller's configured pair.
+        # One-step predictions at t use only observations before t.
+        candidates = np.unique(np.append(np.arange(0.1, 1.01, 0.1),
+                                         [level_alpha, trend_beta]))
+        best_error = float("inf")
+        best_alpha, best_beta = float(level_alpha), float(trend_beta)
+        for alpha in candidates:
+            for beta in candidates:
+                level = float(x[0])
+                trend = float(x[1] - x[0])
+                error = 0.0
+                for value in x[2:]:
+                    prediction = level + trend
+                    error += (float(value) - prediction) ** 2
+                    previous_level = level
+                    level = alpha * float(value) + (1.0 - alpha) * prediction
+                    trend = beta * (level - previous_level) + (1.0 - beta) * trend
+                if error < best_error:
+                    best_error = error
+                    best_alpha, best_beta = float(alpha), float(beta)
+        level_alpha, trend_beta = best_alpha, best_beta
 
     level = float(x[0])
     trend = float(x[1] - x[0]) if x.size > 1 else 0.0
